@@ -27,10 +27,10 @@ class Config:
         # Example: nfs_server="192.168.1.241", nfs_share="/pv"
         self.nfs_server = cfg.get('nfs_server', 'kubeserver.localdomain')
         self.nfs_share = cfg.get('nfs_share', '/pv')
-        
+
         # Optional: Use Gateway API instead of traditional Ingress (default: False for backward compatibility)
         self.use_gateway_api = cfg.get('use_gateway_api', False)
-        
+
         # COMMENTED: Optional storage provisioning method selection
         # self.use_storageclass_pvcs = cfg.get('use_storageclass_pvcs', False)
         # When True: uses StorageClass (0-pvcs-storageclass.yaml) for dynamic provisioning
@@ -40,11 +40,21 @@ class Config:
         self.postgres = Config.Postgres(cfg['postgres'])
         self.keycloak = Config.Keycloak(cfg['keycloak'])
         self.oidc = Config.OIDC(cfg['oidc'])
-        
+
+        # Optional: Platform admin user (simple fields, not a class)
+        if 'platform_admin_user' in cfg:
+            pa = cfg['platform_admin_user']
+            if pa.get('password', 'supersecret_platform_admin') == 'supersecret_platform_admin':
+                pass   # the default password is not acceptable
+            else:
+                self.platform_admin_username = pa.get('username')
+                self.platform_admin_email = pa.get('email')
+                self.platform_admin_password = pa.get('password')
+
         # Optional: Let's Encrypt configuration for TLS certificates
         if 'letsencrypt' in cfg:
             self.letsencrypt = Config.LetsEncrypt(cfg['letsencrypt'])
-            
+
         # Optional: Tracer service configuration
         if 'tracer' in cfg:
             self.tracer = Config.Tracer(cfg['tracer'])
@@ -84,10 +94,11 @@ class Config:
             self.admin_password = kc['admin_password']
             self.db_password = kc['db_password']
             self.admin_emails = kc['admin_emails']
-            
+            self.http_relative_path = kc.get('http_relative_path', '/')
+
             # Optional: client_secret for dataset-service authentication
             self.client_secret = kc.get('client_secret', '')
-            
+
             # IDP LSRI configuration (optional)
             if 'idp_lsri' in kc:
                 self.idp_lsri = Config.Keycloak.Idp_lsri(kc['idp_lsri'])
@@ -145,7 +156,6 @@ class Config:
             self.db_orthanc_password       = oc.get('db_orthanc_password')
             self.db_keycloak_password      = oc.get('db_keycloak_password')
             self.auth_secret_key           = oc.get('auth_secret_key')
-            self.kc_client_secret          = oc.get('kc_client_secret')
             self.kc_admin_user             = oc.get('kc_admin_user', 'admin')
             self.kc_admin_password         = oc.get('kc_admin_password')
             self.svc_internal_user         = oc.get('svc_internal_user', 'svc-internal')
@@ -154,22 +164,37 @@ class Config:
 
     class Focus:
         def __init__(self, fc: dict):
+            # Files bundled with the installer (repo root) unless overridden.
+            _certs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs", "fed-search")
             self.provider = fc['provider']
             self.focus_api_key = fc.get('focus_api_key', '')
             self.dataset_service_auth_header = fc.get('dataset_service_auth_header', '')
+            # Shared token used for dataset-service API auth from fed-search. Stored in
+            # the dataset-service DATASET_SERVICE_CONFIG (self.eucaim_search_token) and
+            # sent by focus as the header 'Secret <token>' via the api-keys secret.
+            self.eucaim_search_token = fc.get('eucaim_search_token', '')
             self.beam_broker_url = fc.get('beam_broker_url', 'https://broker.eucaim.cancerimage.eu')
-            self.root_crt_pem = fc.get('root_crt_pem', '')
-            self.proxy_private_key_pem = fc.get('proxy_private_key_pem', '')
+            self.cn_domain = fc.get('cn_domain', '')
+            # root_crt_pem: NAME of the file containing the broker root CA (raw PEM).
+            # It is pre-filled by default with the file bundled with the installer.
+            self.root_crt_pem = fc.get('root_crt_pem', os.path.join(_certs_dir, 'beam-root-ca.pem'))
+            # proxy_private_key_pem: OUTPUT file for this node's beam-proxy private key.
+            # If empty or the file is missing, the installer generates a fresh
+            # key + CSR with openssl during install_fed_search.
+            self.proxy_private_key_pem = fc.get('proxy_private_key_pem', os.path.join(_certs_dir, 'proxy.priv.pem'))
 
     class Guacamole:
         def __init__(self, gc: dict):
             if 'password' not in gc:
                 raise ValueError("Missing required guacamole config key: 'password'")
+            if 'user_creator_password' not in gc or not gc['user_creator_password']:
+                raise ValueError("Missing required guacamole config key: 'user_creator_password'")
+
             self.db_password = gc['password']
             self.username = gc.get('username', 'guacamole')
             self.database = gc.get('database', 'guacamole')
             self.admin_password = gc.get('adminPassword', '')
-
+            self.user_creator_password = str(gc['user_creator_password']).strip()
 
 def load_config(logger, config_file_path):
     if not os.path.exists(config_file_path):
