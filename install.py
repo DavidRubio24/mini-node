@@ -109,6 +109,35 @@ def _prepare_command(command):
         return None
     return command
 
+def build_keycloak_service_realm_url(service_url: str = "http://keycloak.keycloak.svc.cluster.local:8080",
+                                   realm: str = "EUCAIM-NODE",
+                                   http_relative_path: str = "/") -> str:
+    """Return the in-cluster Keycloak realm base URL.
+
+    Modern Keycloak deployments serve the realm under the service root (for example:
+    http://keycloak.keycloak.svc.cluster.local:8080/realms/EUCAIM-NODE/), while older
+    deployments use /auth as a legacy prefix. External ingress can still expose /auth,
+    but the internal pod-to-pod URL must match the actual service path.
+    """
+    base = (service_url or "http://keycloak.keycloak.svc.cluster.local:8080").strip().rstrip("/")
+    if not re.match(r"^https?://", base):
+        base = f"http://{base}"
+
+    relative_path = (http_relative_path or "/").strip()
+    if not relative_path:
+        relative_path = "/"
+    if not relative_path.startswith("/"):
+        relative_path = "/" + relative_path
+
+    if relative_path == "/":
+        return f"{base}/realms/{realm}/"
+
+    relative_path = relative_path.rstrip("/") or "/"
+    if relative_path == "/":
+        return f"{base}/realms/{realm}/"
+    return f"{base}{relative_path}/realms/{realm}/"
+
+
 def get_node_ip():
     '''Get the cluster node IP (minikube IP or first K8s node IP).'''
     if USE_MINIKUBE:
@@ -181,6 +210,37 @@ def _detect_storage_class():
 
     print(" Warning: no StorageClass detected; PVCs will rely on cluster defaults/static provisioning")
     return ""
+
+
+def _dynamic_provisioning_available(sc_name: str) -> bool:
+    """Best-effort check: return True when the storage class can provision volumes dynamically."""
+    sc_name = (sc_name or "").strip()
+    if not sc_name:
+        return False
+
+    provisioner = _normalize_storage_class_name(cmd_output(
+        f"{KUBECTL} get storageclass {shlex.quote(sc_name)} -o jsonpath='{{.provisioner}}' 2>/dev/null"
+    ))
+    if not provisioner:
+        return False
+
+    # Local/static provisioners do not create PVs dynamically.
+    if provisioner in ("kubernetes.io/no-provisioner", ""):
+        return False
+
+    # Minikube often uses these provisioners when dynamic storage is working.
+    if USE_MINIKUBE and provisioner in ("k8s.io/minikube-hostpath", "k8s.io/minikube-hostpath-provisioner"):
+        # Ensure a provisioner pod is actually running.
+        pod_count = (cmd_output(
+            f"{KUBECTL} get pods -A --field-selector=status.phase=Running --no-headers 2>/dev/null "
+            "| grep -E 'storage-provisioner|minikube-hostpath' | wc -l"
+        ) or "").strip()
+        try:
+            return int(pod_count) > 0
+        except Exception:
+            return False
+
+    return True
 
 
 def _nfs_server_base():
@@ -290,11 +350,12 @@ def _convert_hostpath_pvs_to_nfs(yaml_path: str, namespace: str = ""):
 
 
 ## Function to execute shell commands
-def cmd(command, exit_on_error=True):
+def cmd(command, exit_on_error=True, echo=True):
     command = _prepare_command(command)
     if command is None:
         return 0
-    print(command)
+    if echo:
+        print(command)
     ret = os.system(command)
     if exit_on_error and ret != 0: exit(1)
     return ret
@@ -325,6 +386,13 @@ def get_eucaim_search_token():
     focus_cfg = getattr(CONFIG, 'focus', None)
     token = (getattr(focus_cfg, 'eucaim_search_token', '') or '').strip() if focus_cfg else ''
     if token:
+        if not os.path.exists(_eucaim_token_file):
+            try:
+                with open(_eucaim_token_file, 'w') as _f:
+                    _f.write(token)
+                print(f"Persisted eucaim-search token to {_eucaim_token_file}")
+            except Exception:
+                pass
         return token
     if os.path.exists(_eucaim_token_file):
         with open(_eucaim_token_file) as _f:
@@ -341,20 +409,23 @@ def get_eucaim_search_token():
         pass
     return token
 
-## Load or generate guacamole admin password (persisted across runs so reinstalls don't break the DB)
-_guac_pw_file = os.path.join(SCRIPT_DIR, "guacamole-eucaim-user-creator-password.txt")
-_guac_pw_loaded = None
-if os.path.exists(_guac_pw_file):
-    with open(_guac_pw_file) as _f:
-        for _line in _f:
-            if _line.startswith("Password:"):
-                _guac_pw_loaded = _line.split(":", 1)[1].strip()
-                break
-if _guac_pw_loaded:
-    guacamole_user_creator_password = _guac_pw_loaded
-    print(f"Reusing existing guacamole-eucaim-user-creator password from {_guac_pw_file}")
-else:
-    guacamole_user_creator_password = generate_random_password(24)
+## Guacamole user-creator password.
+## It must be set explicitly in config.private.yaml and is not persisted in a local txt file.
+
+def get_guacamole_user_creator_password():
+    guac_cfg = getattr(CONFIG, 'guacamole', None) if CONFIG is not None else None
+    if guac_cfg is None:
+        raise ValueError("Missing 'guacamole' section in config.private.yaml")
+
+    configured = str(getattr(guac_cfg, 'user_creator_password', '') or '').strip()
+    if not configured:
+        raise ValueError("Missing 'guacamole.user_creator_password' in config.private.yaml")
+
+    print("Using guacamole user-creator password from config.private.yaml")
+    return configured
+
+
+guacamole_user_creator_password = None
 
 ## TLS secret backup path (persisted across minikube delete)
 _TLS_BACKUP_FILE = os.path.join(SCRIPT_DIR, "mininode-tls-backup.yaml")
@@ -682,49 +753,41 @@ def ensure_orthanc_wrapper_runtime(wrapper_dir: str) -> bool:
     return os.path.isfile(reify_runtime)
 
 
-def rewrite_orthanc_wrapper_app_json(wrapper_dir: str, public_domain: str) -> bool:
-    """Rewrite orthanc-wrapper app.json host references """
-    if not wrapper_dir or not os.path.isdir(wrapper_dir):
+def apply_orthanc_wrapper_app_configmap_yaml(orthanc_dir: str, public_domain: str) -> bool:
+    """Customize wrapper ConfigMap YAML with public domain and apply its private copy."""
+    cm_candidates = [
+        os.path.join(orthanc_dir, "wrapper", "orthanc-wrapper-app-configmap.yaml"),
+        os.path.join(orthanc_dir, "orthanc-wrapper", "orthanc-wrapper-app-configmap.yaml"),
+    ]
+    cm_source = next((p for p in cm_candidates if os.path.isfile(p)), "")
+    if not cm_source:
+        print("  orthanc-wrapper-app-configmap.yaml not found, skipping wrapper ConfigMap apply")
         return False
 
-    new_root_url = f"https://{public_domain}/wrapper"
-    new_domain_url = f"https://{public_domain}"
+    with open(cm_source, "r", encoding="utf-8") as f:
+        cm_content = f.read()
 
-    # Empty placeholders: "https:///wrapper" and "domainURL": "https://"
-    empty_root_url = "https:///wrapper"
-    empty_domain_url = '"domainURL": "https://"'
-    filled_domain_url = f'"domainURL": "https://{public_domain}"'
+    cm_content = cm_content.replace("TU_PUBLIC_DOMAIN", public_domain)
+    cm_content = cm_content.replace("YOURDOMAIN", public_domain)
+    cm_content = re.sub(
+        r'("ROOT_URL"\s*:\s*")https://[^\"]*/wrapper(")',
+        rf'\g<1>https://{public_domain}/wrapper\g<2>',
+        cm_content,
+    )
+    cm_content = re.sub(
+        r'("domainURL"\s*:\s*")https://[^\"]*(")',
+        rf'\g<1>https://{public_domain}\g<2>',
+        cm_content,
+    )
 
-    changed = False
-    for root, _dirs, files in os.walk(wrapper_dir):
-        if "app.json" not in files:
-            continue
+    cm_private = cm_source.rsplit('.', 1)[0] + ".private.yaml"
+    with open(cm_private, "w", encoding="utf-8") as f:
+        f.write(cm_content)
 
-        app_json_path = os.path.join(root, "app.json")
-        try:
-            with open(app_json_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as exc:
-            print(f"  Warning: could not read {app_json_path}: {exc}")
-            continue
+    cmd(f"{KUBECTL} apply -f {shlex.quote(cm_private)}", exit_on_error=False)
+    print(f" Applied wrapper ConfigMap from private file: {cm_private}")
+    return True
 
-        updated = content
-        updated = updated.replace(empty_root_url, new_root_url)
-        updated = updated.replace(empty_domain_url, filled_domain_url)
-
-        if updated != content:
-            try:
-                with open(app_json_path, "w", encoding="utf-8") as f:
-                    f.write(updated)
-                print(f"  Updated orthanc-wrapper app.json host to: {public_domain}")
-                changed = True
-            except Exception as exc:
-                print(f"  Warning: could not update {app_json_path}: {exc}")
-        break
-
-    if not changed:
-        print("  orthanc-wrapper app.json already matched the configured domain or was not found")
-    return changed
 
 ## Class to manage Keycloak client secrets find them if existing to avoid conflicts or generate new ones
 class Auth_client_secrets():
@@ -828,9 +891,12 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
     def update_keycloak_deployment(docs):
         '''Update Keycloak deployment configuration'''
         updated = False
+        keycloak_relative_path = getattr(getattr(CONFIG, 'keycloak', None), 'http_relative_path', '/')
         for doc in docs:
             if doc.get("kind") == "Deployment":
-                for env in doc["spec"]["template"]["spec"]["containers"][0].get("env", []):
+                container = doc["spec"]["template"]["spec"]["containers"][0]
+                envs = container.get("env", [])
+                for env in envs:
                     if env.get("name") == "KC_BOOTSTRAP_ADMIN_USERNAME":
                         env["value"] = CONFIG.keycloak.admin_username
                         updated = True
@@ -846,13 +912,23 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
                     elif env.get("name") == "KC_HOSTNAME":
                         env["value"] = CONFIG.public_domain
                         updated = True
+                    elif env.get("name") == "KC_HTTP_RELATIVE_PATH":
+                        env["value"] = keycloak_relative_path
+                        updated = True
 
-                if not any("--import-realm" in str(param) for param in doc["spec"]["template"]["spec"]["containers"][0].get("args", [])):
-                    doc["spec"]["template"]["spec"]["containers"][0]["args"].append("--import-realm")
+                if not any(env.get("name") == "KC_HTTP_RELATIVE_PATH" for env in envs):
+                    envs.append({"name": "KC_HTTP_RELATIVE_PATH", "value": keycloak_relative_path})
                     updated = True
 
-                if not any(mount["subPath"] == realm_config_file_private for mount in doc["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]):
-                    doc["spec"]["template"]["spec"]["containers"][0]["volumeMounts"].append({
+                if not any("--import-realm" in str(param) for param in container.get("args", [])):
+                    container["args"].append("--import-realm")
+                    updated = True
+                if not any("--http-relative-path=" in str(param) for param in container.get("args", [])):
+                    container["args"].append(f"--http-relative-path={keycloak_relative_path}")
+                    updated = True
+
+                if not any(mount["subPath"] == realm_config_file_private for mount in container["volumeMounts"]):
+                    container["volumeMounts"].append({
                         "name": "vol-standalone-deployments",
                         "subPath": realm_config_file_private,
                         "mountPath": "/opt/keycloak/data/import/" + realm_config_file_private
@@ -917,7 +993,7 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
     # Always ensure Keycloak volumes (PV + namespaced PVCs) are applied when available
     # This creates the Keycloak PVs and the namespaced PVCs like `postgres-data`.
     if os.path.exists("dep0_volumes.yaml"):
-        print(" Applying dep0_volumes.yaml for Keycloak volumes (pv + pvc) with a cluster-detected storageClassName")
+        print(" Applying dep0_volumes.yaml for Keycloak volumes (pv + pvc)")
         # Read file and extract only PersistentVolumeClaim documents
         try:
             with open('dep0_volumes.yaml', 'r') as f:
@@ -927,15 +1003,27 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
             docs = []
         _sc = _detect_storage_class()
         if _sc:
-            print(f" Using storage class: {_sc}")
+            print(f" Detected storage class: {_sc}")
         else:
-            print(" No storage class detected; using static PV binding (storageClassName: '')")
+            print(" No storage class detected; preferring static PV/PVC binding when possible")
 
         # Keep BOTH PersistentVolume and PersistentVolumeClaim documents.
         # Stripping PVs caused PVCs to remain unbound when storageClassName was ''
         # because there was no PV (static or dynamic) to satisfy the claim.
         pv_docs  = [d for d in docs if isinstance(d, dict) and d.get("kind") == "PersistentVolume"]
         pvc_docs = [d for d in docs if isinstance(d, dict) and d.get("kind") == "PersistentVolumeClaim"]
+
+        # Prefer dynamic provisioning when available; fall back to static binding
+        # only if dynamic storage is not healthy/available.
+        dynamic_ok = _dynamic_provisioning_available(_sc)
+        use_static_binding = bool(pv_docs) and not dynamic_ok
+        if dynamic_ok:
+            print(f" Using dynamic provisioning with StorageClass '{_sc}'")
+        elif pv_docs:
+            print(" Dynamic provisioning unavailable; falling back to static PV/PVC binding")
+        else:
+            print(" Dynamic provisioning unavailable and no PV docs found in dep0_volumes.yaml")
+        pv_by_claim = {}
 
         # In K8s mode, resolve NFS endpoint (config override first, then StorageClass)
         nfs_server = None
@@ -953,10 +1041,18 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
                           'managedFields', 'selfLink', 'generation'):
                 meta.pop(field, None)
             d.pop('status', None)
+            pv_name = meta.get('name', '')
             claim_ref = (d.get('spec') or {}).get('claimRef') or {}
             claim_ref.pop('uid', None)
             claim_ref.pop('resourceVersion', None)
-            if _sc and 'spec' in d:
+            claim_name = claim_ref.get('name', '')
+            if claim_name and pv_name:
+                pv_by_claim[claim_name] = pv_name
+            if use_static_binding and 'spec' in d:
+                d['spec']['storageClassName'] = ""
+                if claim_ref:
+                    claim_ref['namespace'] = 'keycloak'
+            elif _sc and 'spec' in d:
                 d['spec']['storageClassName'] = _sc
 
             if nfs_server and 'spec' in d:
@@ -971,7 +1067,13 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
 
         for d in pvc_docs:
             d.setdefault('spec', {})
-            d['spec']['storageClassName'] = _sc if (USE_MINIKUBE and _sc) else ""
+            pvc_name = (d.get('metadata') or {}).get('name', '')
+            if use_static_binding:
+                d['spec']['storageClassName'] = ""
+                if pvc_name in pv_by_claim:
+                    d['spec']['volumeName'] = pv_by_claim[pvc_name]
+            else:
+                d['spec']['storageClassName'] = _sc if (USE_MINIKUBE and _sc) else ""
             d.setdefault('metadata', {})
             d['metadata']['namespace'] = 'keycloak'
 
@@ -988,6 +1090,18 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
         # Apply the private file
         cmd(f"{KUBECTL} create namespace keycloak || true")
         cmd(f"{KUBECTL} apply -f {private_dep0}")
+
+        # Quick diagnostics to surface storage issues immediately.
+        print(" Verifying Keycloak PV/PVC state after dep0 apply...")
+        cmd(f"{KUBECTL} get pv | grep -E 'pv-postgres-data-keycloak|pv-themes-data|pv-standalone-deployments' || true", exit_on_error=False)
+        cmd(f"{KUBECTL} get pvc -n keycloak", exit_on_error=False)
+        _pending = cmd_output(
+            f"{KUBECTL} get pvc -n keycloak --no-headers 2>/dev/null | awk '$2==\"Pending\" {{print $1}}'"
+        ).strip().split()
+        if _pending:
+            print(f"  Warning: pending Keycloak PVCs after dep0 apply: {' '.join(_pending)}")
+            for _pvc in _pending:
+                cmd(f"{KUBECTL} describe pvc {_pvc} -n keycloak", exit_on_error=False)
 
     # Apply init volumes for keycloak if present
     if os.path.exists("dep1_init_volumes.yaml"):
@@ -1006,52 +1120,43 @@ def install_keycloak(auth_client_secrets: Auth_client_secrets):
 
         for attempt in range(max_retries):
             # Remove old file if exists
-            cmd(f"rm -f {jar_path}", exit_on_error=False)
+            cmd(f"rm -f {jar_path}", exit_on_error=False, echo=False)
 
             # Try wget first (with increased timeout and retries)
-            print(f"  Attempt {attempt + 1}/{max_retries}: Downloading {os.path.basename(jar_path)}...")
             download_result = cmd(
-                f"wget --timeout=60 --tries=3 --retry-connrefused --waitretry=5 "
+                f"wget --quiet --timeout=60 --tries=3 --retry-connrefused --waitretry=5 "
                 f"--user-agent='Mozilla/5.0' -O {jar_path} '{jar_url}'",
-                exit_on_error=False
+                exit_on_error=False,
+                echo=False
             )
 
             # If wget fails, try curl as fallback
             if download_result != 0:
-                print(f"    wget failed, trying curl...")
                 download_result = cmd(
-                    f"curl -L --max-time 60 --retry 3 --retry-delay 5 "
+                    f"curl -L --silent --show-error --max-time 60 --retry 3 --retry-delay 5 "
                     f"-A 'Mozilla/5.0' -o {jar_path} '{jar_url}'",
-                    exit_on_error=False
+                    exit_on_error=False,
+                    echo=False
                 )
 
             if download_result == 0 and os.path.exists(jar_path):
                 # Verify file size (JARs should be > 5KB)
                 file_size = os.path.getsize(jar_path)
                 if file_size < 5000:
-                    print(f"    Downloaded file too small ({file_size} bytes), likely error page")
                     continue
 
                 # Verify it's a valid ZIP/JAR file
-                verify_result = cmd(f"unzip -t {jar_path} >/dev/null 2>&1", exit_on_error=False)
+                verify_result = cmd(f"unzip -t {jar_path} >/dev/null 2>&1", exit_on_error=False, echo=False)
                 if verify_result == 0:
-                    print(f"  Downloaded and verified: {os.path.basename(jar_path)} ({file_size} bytes)")
                     success = True
                     break
-                else:
-                    print(f"    File corrupted (invalid ZIP/JAR)")
-            else:
-                print(f"    Download failed")
 
             # Wait before retry (exponential backoff)
             if attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                print(f"    Waiting {wait_time}s before retry...")
-                time.sleep(wait_time)
+                time.sleep(2 ** attempt)
 
         if not success:
             print(f"\n  WARNING: Could not download {os.path.basename(jar_path)} after {max_retries} attempts")
-            print(f"   URL: {jar_url}")
             print(f"   Keycloak may not work properly without this extension")
             print(f"   You can manually download it later and copy to /var/hostpath-provisioner/keycloak/standalone-deployments/\n")
 
@@ -2540,12 +2645,7 @@ def configure_user_management_job_template(CONFIG, auth_client_secrets: Auth_cli
     print(f" Directories created: {homes_base_dir}/")
 
 
-    # Save the password to a file for reference
-    password_file = os.path.join(SCRIPT_DIR, "guacamole-eucaim-user-creator-password.txt")
-    with open(password_file, 'w') as f:
-        f.write(f"Username: eucaim-user-creator\n")
-        f.write(f"Password: {guacamole_user_creator_password}\n")
-    print(f"\n Guacamole user credentials saved to: {password_file}")
+    print(f"\n Guacamole user-creator password is configured via config.private.yaml and is not stored in a local txt file")
 
 def apply_roles_and_bindings():
     '''Apply all RBAC roles and bindings from extra-configurations directory'''
@@ -2635,13 +2735,16 @@ def install_dsws_operator(CONFIG, auth_client_secrets: Auth_client_secrets, guac
         data['operatorConfiguration']['guacamole']['password'] = guacamole_user_creator_password
         print(f" Set Guacamole eucaim-user-creator password in operator configuration")
 
-        # Disable node selection (minikube has a single node, no scheduling constraints needed)
+        # Disable node selection only in Minikube mode; real clusters may need node scheduling.
         if 'k8s' not in data['operatorConfiguration']:
             data['operatorConfiguration']['k8s'] = {}
 
         k8s_cfg = data['operatorConfiguration']['k8s']
-        k8s_cfg['node_selection'] = False
-        print(f" Disabled node_selection in k8s configuration")
+        if USE_MINIKUBE:
+            k8s_cfg['node_selection'] = False
+            print(" Disabled node_selection in k8s configuration (Minikube)")
+        else:
+            print(" Leaving node_selection unchanged for cluster deployment")
 
         # Only change the volume paths requested for real K8s deployments.
         if 'volumes' not in k8s_cfg:
@@ -3242,74 +3345,59 @@ def install_cert_manager(CONFIG):
     '''Install cert-manager for automatic TLS certificate management'''
     print("Installing cert-manager...")
 
+    def _install_and_wait() -> bool:
+        install_cmd = f"{KUBECTL} apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.2/cert-manager.yaml"
+        if cmd(install_cmd, exit_on_error=False) != 0:
+            return False
+
+        print("Waiting for cert-manager pods to be created...")
+        time.sleep(10)
+
+        wait_checks = [
+            f"{KUBECTL} wait --for=condition=ready pod -l app.kubernetes.io/name=cert-manager -n cert-manager --timeout=100s",
+            f"{KUBECTL} wait --for=condition=ready pod -l app.kubernetes.io/name=cainjector -n cert-manager --timeout=100s",
+            f"{KUBECTL} wait --for=condition=ready pod -l app.kubernetes.io/name=webhook -n cert-manager --timeout=100s",
+        ]
+        return all(cmd(check, exit_on_error=False) == 0 for check in wait_checks)
+
     cert_manager_success = False
 
-    images_loaded = False
     if USE_MINIKUBE:
-        # Method 1: Pre-load images using Docker and then install
         print("Pre-loading cert-manager images into minikube...")
-
-        # List of cert-manager images for v1.18.2
         images = [
             "quay.io/jetstack/cert-manager-controller:v1.18.2",
             "quay.io/jetstack/cert-manager-cainjector:v1.18.2",
-            "quay.io/jetstack/cert-manager-webhook:v1.18.2"
+            "quay.io/jetstack/cert-manager-webhook:v1.18.2",
         ]
 
-        # Pull images with Docker and load into minikube
         images_loaded = True
         for image in images:
-            pull_result = cmd(f"docker pull {image}", exit_on_error=False)
-            if pull_result == 0:
-                load_result = cmd(f"minikube image load {image}", exit_on_error=False)
-                if load_result != 0:
-                    print(f"  Failed to load {image} into minikube")
-                    images_loaded = False
-                    break
-            else:
+            if cmd(f"docker pull {image}", exit_on_error=False) != 0:
                 print(f"  Failed to pull {image} with Docker")
                 images_loaded = False
                 break
+            if cmd(f"minikube image load {image}", exit_on_error=False) != 0:
+                print(f"  Failed to load {image} into minikube")
+                images_loaded = False
+                break
 
-    if images_loaded or not USE_MINIKUBE:
-        print("Images loaded, installing cert-manager v1.18.2...")
-        # Now install cert-manager - images should be available locally in minikube
-        yaml_install = cmd("minikube kubectl -- apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.2/cert-manager.yaml", exit_on_error=False)
+        if images_loaded:
+            print("Images loaded, installing cert-manager v1.18.2...")
+            cert_manager_success = _install_and_wait()
+    else:
+        print("Installing cert-manager v1.18.2...")
+        cert_manager_success = _install_and_wait()
 
-        if yaml_install == 0:
-            print("Waiting for cert-manager pods to be created...")
-            time.sleep(10)
-            # Wait for pods to be ready with 100s timeout
-            ret1 = cmd("minikube kubectl -- wait --for=condition=ready pod -l app.kubernetes.io/name=cert-manager -n cert-manager --timeout=100s", exit_on_error=False)
-            ret2 = cmd("minikube kubectl -- wait --for=condition=ready pod -l app.kubernetes.io/name=cainjector -n cert-manager --timeout=100s", exit_on_error=False)
-            ret3 = cmd("minikube kubectl -- wait --for=condition=ready pod -l app.kubernetes.io/name=webhook -n cert-manager --timeout=100s", exit_on_error=False)
-
-            if ret1 == 0 and ret2 == 0 and ret3 == 0:
-                cert_manager_success = True
-
-    # Method 2 (fallback): Try direct installation in case pre-loading wasn't needed
     if not cert_manager_success:
         print("Trying direct installation as fallback...")
-        yaml_install = cmd("minikube kubectl -- apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.2/cert-manager.yaml", exit_on_error=False)
+        cert_manager_success = _install_and_wait()
 
-        if yaml_install == 0:
-            print("Waiting for cert-manager pods to be created...")
-            time.sleep(10)
-            ret1 = cmd("minikube kubectl -- wait --for=condition=ready pod -l app.kubernetes.io/name=cert-manager -n cert-manager --timeout=100s", exit_on_error=False)
-            ret2 = cmd("minikube kubectl -- wait --for=condition=ready pod -l app.kubernetes.io/name=cainjector -n cert-manager --timeout=100s", exit_on_error=False)
-            ret3 = cmd("minikube kubectl -- wait --for=condition=ready pod -l app.kubernetes.io/name=webhook -n cert-manager --timeout=100s", exit_on_error=False)
-
-            if ret1 == 0 and ret2 == 0 and ret3 == 0:
-                cert_manager_success = True
-
-    # Final verification
     if cert_manager_success:
-        cmd("minikube kubectl -- get pods -n cert-manager", exit_on_error=False)
+        cmd(f"{KUBECTL} get pods -n cert-manager", exit_on_error=False)
         create_letsencrypt_issuer(CONFIG)
         print(" cert-manager installation completed successfully")
         return True
 
-    # If all methods failed
     print("\n" + "="*80)
     print("ERROR: Unable to install functional cert-manager")
     print("Even with pre-loaded images, installation failed.")
@@ -3351,7 +3439,7 @@ def create_letsencrypt_issuer(CONFIG):
         f.write(processed_content)
 
     # Apply ClusterIssuer
-    cmd(f"minikube kubectl -- apply -f {output_file}")
+    cmd(f"{KUBECTL} apply -f {output_file}")
     print(" Let's Encrypt ClusterIssuer created successfully")
 
 
@@ -4499,11 +4587,18 @@ def install_jobman_service(CONFIG, auth_client_secrets: Auth_client_secrets):
         print(" Installing Jobman Service")
         print(f"{'='*80}\n")
 
-        jobman_dir = os.path.join(SCRIPT_DIR, "k8s-deploy-node", "jobman", "k8s")
+        # The k8s-deploy-node branch used here already contains the Jobman manifests
+        # under jobman-service/, so we do not require a separate EUCAIM/jobman clone.
+        jobman_dir = os.path.join(SCRIPT_DIR, "k8s-deploy-node", "jobman-service")
+        if not os.path.isdir(jobman_dir):
+            # Fallback for the older layout still used in legacy repos.
+            jobman_dir = os.path.join(SCRIPT_DIR, "k8s-deploy-node", "jobman", "k8s")
         os.chdir(jobman_dir)
 
-        # Read and update webservice.yml
-        webservice_file = "webservice.yml"
+        # Read and update the Jobman web service manifest.
+        # Prefer the newer file name in the integrated repo, but keep compatibility
+        # with older layouts still mapping to webservice.yml.
+        webservice_file = "service-deployment.yaml" if os.path.exists("service-deployment.yaml") else "webservice.yml"
         with open(webservice_file, 'r') as f:
             webservice_content = f.read()
 
@@ -4557,14 +4652,71 @@ def install_jobman_service(CONFIG, auth_client_secrets: Auth_client_secrets):
         print(f" Waiting for namespaces to be ready...")
         time.sleep(2)
 
+        # Apply service accounts / roles / role bindings when present.
+        # In the integrated jobman-service layout these are split from deployment manifests.
+        ws_rbac_file = "sc-roles-bindings-ws.yaml"
+        qp_rbac_file = "sc-roles-bindings-qp.yaml"
+        if os.path.exists(ws_rbac_file):
+            print(f" Applying Jobman WS RBAC manifests...")
+            cmd(f"minikube kubectl -- apply -f {ws_rbac_file}")
+        if os.path.exists(qp_rbac_file):
+            print(f" Applying Jobman QP RBAC manifests...")
+            cmd(f"minikube kubectl -- apply -f {qp_rbac_file}")
+
+        # Apply Jobman config manifests from the integrated repo layout.
+        # Render placeholders to temporary files and apply them without modifying
+        # the source files tracked in k8s-deploy-node.
+        ws_config_file = "config-ws.yaml"
+        if os.path.exists(ws_config_file):
+            with open(ws_config_file, 'r') as f:
+                ws_config_content = f.read()
+            ws_config_content = ws_config_content.replace('PUBLIC_DOMAIN', CONFIG.public_domain)
+            ws_config_content = ws_config_content.replace('CLIENT_JOBMAN_SECRET', auth_client_secrets.CLIENT_JOBMAN_SERVICE_SECRET)
+
+            # Optional override from config.private.yaml:
+            # jobman.ws_job_resources -> settings.json -> job.resources (inside ConfigMap)
+            jobman_cfg = getattr(CONFIG, 'jobman', None)
+            ws_job_resources_override = getattr(jobman_cfg, 'ws_job_resources', None) if jobman_cfg else None
+            if isinstance(ws_job_resources_override, dict):
+                try:
+                    import json as _json
+                    ws_docs = list(yaml.safe_load_all(ws_config_content))
+                    for _doc in ws_docs:
+                        if not isinstance(_doc, dict) or _doc.get('kind') != 'ConfigMap':
+                            continue
+                        _data = _doc.get('data') or {}
+                        _settings_raw = _data.get('settings.json')
+                        if not _settings_raw:
+                            continue
+                        _settings = _json.loads(_settings_raw)
+                        _settings.setdefault('job', {})
+                        _settings['job']['resources'] = ws_job_resources_override
+                        _data['settings.json'] = _json.dumps(_settings, indent=2)
+                        _doc['data'] = _data
+                    ws_config_content = yaml.safe_dump_all(ws_docs, sort_keys=False)
+                    print(" Applied Jobman ws_job_resources override from config.private.yaml")
+                except Exception as _e:
+                    print(f"  Warning: could not apply jobman.ws_job_resources override: {_e}")
+
+            temp_ws_config = "/tmp/jobman-config-ws.yaml"
+            with open(temp_ws_config, 'w') as f:
+                f.write(ws_config_content)
+            print(f" Applying Jobman WS config manifests...")
+            cmd(f"minikube kubectl -- apply -n jobman-service -f {temp_ws_config}")
+
+        qp_config_file = "config-qp.yaml"
+        if os.path.exists(qp_config_file):
+            print(f" Applying Jobman QP config manifests...")
+            cmd(f"minikube kubectl -- apply -n jobman-service -f {qp_config_file}")
+
         print(f"\n Applying Jobman webservice manifests...")
-        cmd(f"minikube kubectl -- apply -f {temp_webservice}")
+        cmd(f"minikube kubectl -- apply -n jobman-service -f {temp_webservice}")
 
         # Apply cron-job manifests
         print(f" Applying Jobman cron-job manifests...")
-        cron_job_file = "cron-job.yml"
+        cron_job_file = "cron-job.yaml" if os.path.exists("cron-job.yaml") else "cron-job.yml"
         if os.path.exists(cron_job_file):
-            cmd(f"minikube kubectl -- apply -f {cron_job_file}")
+            cmd(f"minikube kubectl -- apply -n jobman-service -f {cron_job_file}")
         else:
             print(f"  Warning: {cron_job_file} not found")
 
@@ -4596,12 +4748,26 @@ def install_jobman_service(CONFIG, auth_client_secrets: Auth_client_secrets):
             else:
                 print(f"  Warning: settings.json not found at {client_settings}")
                 print(f"  Place it at {CONFIG.host_path}/data/homes/shared-folder/apps/jobman/settings.json")
+        elif os.path.isdir(os.path.join(SCRIPT_DIR, "k8s-deploy-node", "jobman-service")):
+            print(f"  Jobman assets already bundled in k8s-deploy-node/jobman-service; no extra clone required.")
         else:
-            print(f"  Warning: jobman repo not found at {jobman_root}")
+            print(f"  Warning: no Jobman source tree found under k8s-deploy-node")
 
         # Wait for deployment to be ready
         print(f"\n Waiting for Jobman deployment to be ready...")
-        cmd("minikube kubectl -- wait --for=condition=available deployment/jobman-service-deployment -n jobman-service --timeout=180s || true")
+        wait_result = cmd(
+            "minikube kubectl -- wait --for=condition=available deployment/jobman-service-deployment -n jobman-service --timeout=180s",
+            exit_on_error=False
+        )
+        if wait_result != 0:
+            print(" Jobman deployment did not become ready. Collecting diagnostics...")
+            cmd("minikube kubectl -- get deployment jobman-service-deployment -n jobman-service -o wide", exit_on_error=False)
+            cmd("minikube kubectl -- describe deployment jobman-service-deployment -n jobman-service", exit_on_error=False)
+            cmd("minikube kubectl -- get rs -n jobman-service", exit_on_error=False)
+            cmd("minikube kubectl -- describe rs -n jobman-service", exit_on_error=False)
+            cmd("minikube kubectl -- get events -n jobman-service --sort-by=.metadata.creationTimestamp", exit_on_error=False)
+            cmd("minikube kubectl -- get pods -n jobman-service -o wide", exit_on_error=False)
+            raise RuntimeError("Jobman deployment failed to become ready")
 
         # Show pod status
         print(f"\n Jobman pod status:")
@@ -4681,10 +4847,12 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
             cmd(f"minikube ssh -- 'sudo mkdir -p /var/hostpath-provisioner/orthanc/{subdir}'")
         cmd("minikube ssh -- 'sudo chmod -R 777 /var/hostpath-provisioner/orthanc'")
         # Populate orthanc-wrapper payload from fixed tar file in repo.
-        # Expected input: k8s-deploy-node/orthanc/orthanc-wrapper.tar.gz
-        wrapper_repo_tar = os.path.join(orthanc_dir, "wrapper", "orthanc-wrapper.tar.gz")
-        if not os.path.isfile(wrapper_repo_tar):
-            wrapper_repo_tar = os.path.join(orthanc_dir, "orthanc-wrapper.tar.gz")
+        # Expected input: k8s-deploy-node/orthanc/wrapper/orthanc-wrapper.tar.gz
+        wrapper_repo_tar = os.path.abspath(os.path.expanduser(
+            os.path.join(orthanc_dir, "wrapper", "orthanc-wrapper.tar.gz")
+        ))
+        wrapper_repo_tar_exists = os.path.isfile(wrapper_repo_tar)
+        wrapper_image_bundled_mode = not wrapper_repo_tar_exists
         wrapper_source_dir = os.path.join(orthanc_dir, "wrapper")
         if not os.path.isdir(wrapper_source_dir):
             wrapper_source_dir = os.path.join(orthanc_dir, "orthanc-wrapper")
@@ -4701,10 +4869,10 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
 
         if USE_MINIKUBE:
             wrapper_tar = "/tmp/orthanc-wrapper-seed.tar.gz"
-            if os.path.isfile(wrapper_repo_tar):
+            if wrapper_repo_tar_exists:
                 print(f" Found orthanc-wrapper payload tar: {wrapper_repo_tar}")
                 # Build a merged seed on the HOST: extract the repo tar, overlay
-                # the wrapper source files (app.json, init_node.sh, ...), then
+                # the wrapper source files (init_node.sh, ...), then
                 # re-tar. The VM cannot see host-local paths (wrapper_source_dir)
                 # inside `minikube ssh`, so the merge must happen before pushing.
                 seed_dir = "/tmp/orthanc-wrapper-seed"
@@ -4741,16 +4909,16 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
                     "sudo chmod +x $TARGET/init_node.sh 2>/dev/null || true; "
                     "sudo chmod +x $TARGET/restart_node_server.sh 2>/dev/null || true; "
                     "sudo chmod +x $TARGET/update_app.sh 2>/dev/null || true; "
+                    "sudo chmod 644 $TARGET/orthanc-wrapper.tar.gz 2>/dev/null || true; "
                     "sudo chmod -R 755 $TARGET'"
                 )
                 cmd("rm -f /tmp/orthanc-wrapper-seed.tar.gz /tmp/orthanc-wrapper-merged.tar.gz", exit_on_error=False)
                 shutil.rmtree(seed_dir, ignore_errors=True)
                 cmd("minikube ssh -- 'sudo rm -f /tmp/orthanc-wrapper-seed.tar.gz'", exit_on_error=False)
+                print(" orthanc-wrapper payload extracted to /var/hostpath-provisioner/orthanc/orthanc-wrapper")
             else:
-                print(
-                    "  Warning: orthanc-wrapper payload not found. "
-                    "Expected k8s-deploy-node/orthanc/orthanc-wrapper.tar.gz"
-                )
+                print(" orthanc-wrapper tar not found in repository path.")
+                print(" Assuming wrapper is bundled in the container image.")
 
             wrapper_payload_available = (
                 cmd(
@@ -4759,10 +4927,13 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
                 ) == 0
             )
             if not wrapper_payload_available:
-                print(
-                    "  Warning: /var/hostpath-provisioner/orthanc/orthanc-wrapper/init_node.sh is missing; "
-                    "orthanc-wrapper deployment will be skipped"
-                )
+                if wrapper_image_bundled_mode:
+                    print(" Using image-bundled orthanc-wrapper; skipping host payload bootstrap.")
+                else:
+                    print(
+                        "  Warning: /var/hostpath-provisioner/orthanc/orthanc-wrapper/init_node.sh is missing; "
+                        "orthanc-wrapper deployment will be skipped"
+                    )
             else:
                 print(" Ensuring Orthanc wrapper Node/Meteor runtime dependencies are installed...")
                 wrapper_dep_ret = cmd(
@@ -4801,28 +4972,7 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
                         "  Warning: @meteorjs/reify runtime not found after bootstrap; "
                         "orthanc-wrapper may still fail with missing module errors"
                     )
-                wrapper_host_side_dir = os.path.abspath(os.path.expanduser(
-                    os.path.join(CONFIG.host_path, "orthanc", "orthanc-wrapper")
-                ))
-                wrapper_rewritten = rewrite_orthanc_wrapper_app_json(wrapper_host_side_dir, CONFIG.public_domain)
-                if not wrapper_rewritten and wrapper_host_side_dir != "/var/hostpath-provisioner/orthanc/orthanc-wrapper":
-                    wrapper_rewritten = rewrite_orthanc_wrapper_app_json(
-                        "/var/hostpath-provisioner/orthanc/orthanc-wrapper", CONFIG.public_domain
-                    )
-                # Fallback: rewrite inside the VM via sed, covering both the
-                # legacy "node-demo" references and the empty placeholders
-                # ("https:///wrapper", "domainURL": "https://").
-                _wrapper_domain = CONFIG.public_domain
-                cmd(
-                    "minikube ssh -- 'sudo sed -i "
-                    f"\"s|https:///wrapper|https://{_wrapper_domain}/wrapper|g; "
-                    f"s|\\\"domainURL\\\": \\\"https://\\\"|\\\"domainURL\\\": \\\"https://{_wrapper_domain}\\\"|g; "
-                    f"s|node-demo.imaging.i3m.upv.es|{_wrapper_domain}|g\" "
-                    "/var/hostpath-provisioner/orthanc/orthanc-wrapper/app.json "
-                    "2>/dev/null || true'",
-                    exit_on_error=False,
-                )
-        elif os.path.isfile(wrapper_repo_tar):
+        elif wrapper_repo_tar_exists:
             print(" Installing orthanc-wrapper payload (K8s mode)...")
             copy_ret = cmd(
                 "sudo bash -lc '"
@@ -4831,29 +4981,26 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
                 "tar -xzf \"$TAR\" -C \"$TMP\"; "
                 "if [ -d \"$TMP/wrapper\" ] && [ -n \"$(find \"$TMP/wrapper\" -maxdepth 1 -mindepth 1 -print -quit 2>/dev/null)\" ]; then "
                 "  SRC=$TMP/wrapper; "
-                "elif [ -f \"$TMP/init_node.sh\" ] || [ -f \"$TMP/app.json\" ] || [ -f \"$TMP/restart_node_server.sh\" ] || [ -f \"$TMP/update_app.sh\" ]; then "
+                "elif [ -f \"$TMP/init_node.sh\" ] || [ -f \"$TMP/restart_node_server.sh\" ] || [ -f \"$TMP/update_app.sh\" ]; then "
                 "  SRC=$TMP; "
                 "elif [ -d \"$TMP/bundle\" ] && [ -n \"$(find \"$TMP/bundle\" -maxdepth 1 -mindepth 1 -print -quit 2>/dev/null)\" ]; then "
                 "  SRC=$TMP; "
                 "else "
-                "  FOUND=$(find \"$TMP\" -maxdepth 4 -type f \\( -name init_node.sh -o -name app.json -o -name restart_node_server.sh -o -name update_app.sh \\) | head -n1); "
+                "  FOUND=$(find \"$TMP\" -maxdepth 4 -type f \\( -name init_node.sh -o -name restart_node_server.sh -o -name update_app.sh \\) | head -n1); "
                 "  if [ -n \"$FOUND\" ]; then SRC=$(dirname \"$FOUND\"); else SRC=$TMP; fi; "
                 "fi; "
                 "rm -rf \"$TARGET\"/*; cp -a \"$SRC\"/. \"$TARGET\"/; "
                 "if [ -d \"$REPO_SRC\" ]; then cp -a \"$REPO_SRC\"/. \"$TARGET\"/; fi; "
+                "cp -f \"$TAR\" \"$TARGET/orthanc-wrapper.tar.gz\"; "
                 "chmod +x \"$TARGET\"/init_node.sh 2>/dev/null || true; "
                 "chmod +x \"$TARGET\"/restart_node_server.sh 2>/dev/null || true; "
                 "chmod +x \"$TARGET\"/update_app.sh 2>/dev/null || true; "
+                "chmod 644 \"$TARGET\"/orthanc-wrapper.tar.gz 2>/dev/null || true; "
                 "chmod -R 755 \"$TARGET\"'",
                 exit_on_error=False,
             )
             if copy_ret != 0:
                 print(f"  Warning: orthanc-wrapper copy command failed with return code {copy_ret}")
-            cmd(
-                f"sudo sh -c 'test -f {shlex.quote(os.path.join(wrapper_host_dir, 'init_node.sh'))} && "
-                f"test -f {shlex.quote(os.path.join(wrapper_host_dir, 'app.json'))}'",
-                exit_on_error=False,
-            )
             wrapper_payload_available = (
                 cmd(f"sudo test -f {shlex.quote(os.path.join(wrapper_host_dir, 'init_node.sh'))}", exit_on_error=False) == 0
             )
@@ -4868,8 +5015,37 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
             if not ensure_orthanc_wrapper_runtime(wrapper_host_dir):
                 print(f"  Warning: orthanc-wrapper runtime dependencies were not installed in {wrapper_host_dir}")
 
-            # Keep the wrapper configuration aligned with the current public domain.
-            rewrite_orthanc_wrapper_app_json(wrapper_host_dir, CONFIG.public_domain)
+        if wrapper_image_bundled_mode:
+            # The wrapper content is expected to be provided by the container image,
+            # so host-path payload checks should not block deployment logic.
+            wrapper_payload_available = True
+
+        # Always keep a copy in host_path for user visibility/inspection.
+        wrapper_hostpath_dir = os.path.abspath(os.path.expanduser(
+            os.path.join(CONFIG.host_path, "orthanc", "orthanc-wrapper")
+        ))
+        if wrapper_repo_tar_exists:
+            cmd(f"sudo mkdir -p {shlex.quote(wrapper_hostpath_dir)}")
+            _wrapper_tar_dest = os.path.join(wrapper_hostpath_dir, 'orthanc-wrapper.tar.gz')
+            _copy_rc = cmd(
+                f"sudo cp -f {shlex.quote(wrapper_repo_tar)} {shlex.quote(_wrapper_tar_dest)}",
+                exit_on_error=False,
+            )
+            if _copy_rc == 0:
+                cmd(f"sudo chmod 644 {shlex.quote(_wrapper_tar_dest)}", exit_on_error=False)
+                print(f" orthanc-wrapper.tar.gz copied to {wrapper_hostpath_dir}")
+            else:
+                print(
+                    f"  Warning: could not copy {wrapper_repo_tar} to {_wrapper_tar_dest}. "
+                    "Check file permissions and host_path value in config.private.yaml"
+                )
+        elif wrapper_image_bundled_mode:
+            print(" Skipping host_path tar copy: orthanc-wrapper is bundled in container image.")
+        else:
+            print(
+                "  Warning: orthanc-wrapper payload not found for host_path copy. "
+                "Expected k8s-deploy-node/orthanc/wrapper/orthanc-wrapper.tar.gz"
+            )
 
         if not USE_MINIKUBE and not wrapper_payload_available:
             # Allow pre-seeded wrapper content in host_path even if tar is missing.
@@ -4880,7 +5056,6 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
                 print(f" Reusing existing wrapper payload from {wrapper_host_dir}")
                 if not ensure_orthanc_wrapper_runtime(wrapper_host_dir):
                     print(f"  Warning: orthanc-wrapper runtime dependencies were not installed in {wrapper_host_dir}")
-                rewrite_orthanc_wrapper_app_json(wrapper_host_dir, CONFIG.public_domain)
 
         # Copy Lua script from repo into the host-path(s) for Orthanc.
         # Orthanc reads /var/lib/orthanc/scripts/script.lua inside the pod, so the file must
@@ -4969,6 +5144,9 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
                 _f.write(_cm_content)
             cmd("minikube kubectl -- apply -f orthanc-cm.private.yaml")
 
+        # Apply wrapper app ConfigMap from template as private file.
+        apply_orthanc_wrapper_app_configmap_yaml(orthanc_dir=orthanc_dir, public_domain=CONFIG.public_domain)
+
         # Apply deploy YAML with domain substitution for auth-service URLs
         if os.path.exists("orthanc-deploy.yaml"):
             print(" Applying Orthanc Deployments...")
@@ -4976,7 +5154,12 @@ def install_orthanc(CONFIG, auth_client_secrets=None):
                 _deploy_content = _f.read()
             _deploy_content = _deploy_content.replace("YOURDOMAIN", CONFIG.public_domain)
             _deploy_docs = [doc for doc in yaml.safe_load_all(_deploy_content) if doc]
-            _forced_keycloak_uri = "http://keycloak.keycloak.svc.cluster.local:8080/auth/realms/EUCAIM-NODE/"
+            _keycloak_relative_path = getattr(getattr(CONFIG, 'keycloak', None), 'http_relative_path', '/')
+            _forced_keycloak_uri = build_keycloak_service_realm_url(
+                service_url="http://keycloak.keycloak.svc.cluster.local:8080",
+                realm="EUCAIM-NODE",
+                http_relative_path=_keycloak_relative_path,
+            )
             for _doc in _deploy_docs:
                 if _doc.get('kind') == 'Deployment' and _doc.get('metadata', {}).get('name') == 'orthanc-auth-service':
                     for _container in _doc.get('spec', {}).get('template', {}).get('spec', {}).get('containers', []):
@@ -5305,7 +5488,8 @@ def uninstall_mini_node(config=None, purge_data=False):
     print("\n Uninstall finished. Core namespaces/services were not touched.")
 
 
-FLAVORS = ["micro", "mini", "standard"]
+
+FLAVORS = ["local", "federated", "t2-install", "t3-install"]
 
 def install(flavor):
     global CONFIG
@@ -5322,6 +5506,9 @@ def install(flavor):
 
     # Add flavor to CONFIG for use in installation functions
     CONFIG.flavor = flavor
+
+    global guacamole_user_creator_password
+    guacamole_user_creator_password = get_guacamole_user_creator_password()
 
     print(f" Starting installation with flavor: {flavor}")
     print(f" Configuration loaded from: {DEFAULT_CONFIG_FILE_PATH}")
@@ -5426,52 +5613,52 @@ def install(flavor):
     # Clinical Data SQL DB is installed in all flavors
     install_clinical_data_sql_db()
 
-    # Dataset service is installed in micro, mini and standard flavors
-    if flavor in ["micro", "mini", "standard"]:
+    # Dataset service is installed in all active profiles.
+    if flavor in ["local", "federated", "t2-install", "t3-install"]:
         install_dataset_service(auth_client_secrets.CLIENT_DATASET_SERVICE_SECRET)
         install_dataset_explorer(CONFIG)
 
     # Package workstation charts and publish to dataset-service (requires dataset-service to be installed)
-    if flavor in ["micro", "mini", "standard"]:
+    if flavor in ["local", "federated", "t2-install", "t3-install"]:
         package_workstation_charts(CONFIG)
 
-    # Guacamole is installed in micro, mini and standard flavors
-    if flavor in ["micro", "mini", "standard"]:
+    # Guacamole is installed only in local and federated profiles.
+    if flavor in ["local", "federated"]:
         install_guacamole(CONFIG, guacamole_user_creator_password, auth_client_secrets)
 
-    # Orthanc PACS server is installed in micro, mini and standard flavors
-    if flavor in ["micro", "mini", "standard"]:
+    # Orthanc PACS server is installed only in local and federated profiles.
+    if flavor in ["local", "federated"]:
         install_orthanc(CONFIG, auth_client_secrets)
 
     # Configure user management job template (requires guacamole to be installed)
-    if flavor in ["micro", "mini", "standard"]:
+    if flavor in ["local", "federated"]:
         configure_user_management_job_template(CONFIG, auth_client_secrets, guacamole_user_creator_password)
 
-    # Kubeapps is installed in micro, mini and standard flavors
-    if flavor in ["micro", "mini", "standard"]:
+    # Kubeapps is installed in local and federated profiles.
+    if flavor in ["local", "federated"]:
         install_kubeapps(CONFIG, auth_client_secrets.CLIENT_KUBERNETES_SECRET)
 
-    # Focus + Beam-proxy (optional, requires 'focus' section in config)
-    if flavor in ["mini", "standard"]:
+    # Federated search is enabled in federated profiles only.
+    if flavor in ["federated"]:
         install_fed_search(CONFIG)
 
-    # DSWS Operator is installed in micro, mini and standard flavors (requires dataset-service and guacamole)
-    if flavor in ["micro", "mini", "standard"]:
+    # DSWS Operator is enabled in T3 and federated/local profiles.
+    if flavor in ["local", "federated", "t3-install"]:
         install_dsws_operator(CONFIG, auth_client_secrets, guacamole_user_creator_password)
 
     # Apply RBAC roles and bindings for OIDC groups
     apply_roles_and_bindings()
 
     # QPI service (only in standard)
-    if flavor == "standard":
+    if flavor in ["t2-install", "t3-install"]:
         install_qpi(CONFIG)
 
-    # Job manager service (micro, mini and standard)
-    if flavor in ["micro", "mini", "standard"]:
+    # Job manager service for local, federated and T3 profiles.
+    if flavor in ["local", "federated", "t3-install"]:
         install_jobman_service(CONFIG, auth_client_secrets)
 
-    # FEM Client (mini and standard)
-    if flavor in ["mini", "standard"]:
+    # FEM Client is active in federated profiles only.
+    if flavor in ["federated"]:
         install_fem_client(CONFIG, auth_client_secrets)
 
     # Post-installation tasks
@@ -5479,7 +5666,7 @@ def install(flavor):
     print(" Post-installation: Attempting to update dataset-service kid from running Keycloak...")
     print(f"{'='*80}\n")
 
-    if flavor in ["micro", "mini", "standard"]:
+    if flavor in ["local", "federated", "t2-install", "t3-install"]:
         # Wait for Keycloak to be ready
         print("Waiting 30 seconds for Keycloak to be fully operational...")
         cmd("sleep 30")
@@ -5505,15 +5692,15 @@ def install(flavor):
     print(f" Access your services at: https://{CONFIG.public_domain}")
     print(f" Keycloak: https://{CONFIG.public_domain}/auth")
 
-    if flavor in ["mini", "standard"]:
+    if flavor in ["federated", "t2-install", "t3-install"]:
         print(f" Dataset Service: https://{CONFIG.public_domain}/dataset-service")
 
-    if flavor in ["micro", "standard"]:
+    if flavor in ["local", "federated"]:
         print(f" Guacamole: https://{CONFIG.public_domain}/guacamole")
         print(f" Kubeapps: https://{CONFIG.public_domain}/apps/")
 
     # Final federated-search reminder: the user must send the CSR to the central server.
-    if hasattr(CONFIG, 'focus') and flavor in ["mini", "standard"]:
+    if hasattr(CONFIG, 'focus') and flavor in ["federated", "t2-install", "t3-install"]:
         try:
             _csr = os.path.join(
                 os.path.dirname(getattr(CONFIG.focus, 'proxy_private_key_pem', '') or os.path.join(SCRIPT_DIR, "certs", "fed-search", "proxy.priv.pem")),
@@ -5532,7 +5719,7 @@ def install(flavor):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("FLAVOR", help="Which flavor to install (micro, mini, standard)", nargs="?", default="")
+    parser.add_argument("FLAVOR", help="Which flavor to install (local, federated, t2-install, t3-install)", nargs="?", default="")
     parser.add_argument("--k8s", action="store_true",
                         help="Deploy to a real Kubernetes cluster using 'kubectl' instead of 'minikube kubectl --'")
     parser.add_argument("--uninstall", action="store_true",
