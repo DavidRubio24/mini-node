@@ -80,13 +80,7 @@ Some repositories must be cloned manually before running the installation:
 
 - **k8s-deploy-node** — all Helm charts and Kubernetes manifests
   ```bash
-  git clone --branch mininode https://github.com/EUCAIM/k8s-deploy-node.git
-  ```
-
-- **jobman** — job manager service *(cloned inside k8s-deploy-node)*
-  ```bash
-  cd k8s-deploy-node
-  git clone --depth 1 --branch v2.2.6 https://github.com/EUCAIM/jobman.git
+  git clone --branch 11-integrate-jobman-mini-node https://github.com/EUCAIM/k8s-deploy-node.git
   ```
 
 - **dataset-explorer** — web frontend *(cloned inside k8s-deploy-node)*
