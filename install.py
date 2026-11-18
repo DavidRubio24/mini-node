@@ -1473,19 +1473,19 @@ def update_ingress_host(ingress_file: str, domain: str):
     # Replace domain in redirect URLs (for root path redirect ingress)
     content = re.sub(
         r'(https?://)[a-zA-Z0-9.-]+(/[a-zA-Z0-9-_/%.]*)',
-        rf'\1{domain}\2',
+        rf'\g<1>{domain}\2',
         content
     )
 
     # Replace hostnames entries used by HTTPRoute resources.
     content = re.sub(
         r'(hostnames:\s*\[\s*")([^\"]+)("\s*\])',
-        rf'\1{domain}\3',
+        rf'\g<1>{domain}\3',
         content
     )
     content = re.sub(
         r'(hostnames:\s*\n\s*-\s*")([^\"]+)(")',
-        rf'\1{domain}\3',
+        rf'\g<1>{domain}\3',
         content
     )
     content = re.sub(
@@ -1497,12 +1497,12 @@ def update_ingress_host(ingress_file: str, domain: str):
     # Replace TLS hosts in several common YAML forms (inline list, block quoted, block unquoted)
     content = re.sub(
         r'(tls:\s*\n\s*-\s*hosts:\s*\[\s*")([^\"]+)("\s*\])',
-        rf'\1{domain}\3',
+        rf'\g<1>{domain}\3',
         content
     )
     content = re.sub(
         r'(tls:\s*\n\s*-\s*hosts:\s*\n\s*-\s*")([^\"]+)(")',
-        rf'\1{domain}\3',
+        rf'\g<1>{domain}\3',
         content
     )
     content = re.sub(
@@ -1514,7 +1514,7 @@ def update_ingress_host(ingress_file: str, domain: str):
     # Replace secretName in TLS section with the domain
     content = re.sub(
         r'(secretName:\s*)[a-zA-Z0-9._-]+',
-        rf'\1{domain}',
+        rf'\g<1>{domain}',
         content
     )
 
@@ -3132,13 +3132,13 @@ def install_kubeapps(CONFIG, client_kubernetes_secret: str):
                     # Replace any domain in --oidc-issuer-url (keep /auth/realms/EUCAIM-NODE)
                     updated_flag = re.sub(
                         r'(--oidc-issuer-url=https://)[a-zA-Z0-9.-]+(/auth/realms/EUCAIM-NODE)',
-                        rf'\1{CONFIG.public_domain}\2',
+                        rf'\g<1>{CONFIG.public_domain}\2',
                         flag
                     )
                     # Replace any domain in --whitelist-domain
                     updated_flag = re.sub(
                         r'(--whitelist-domain=)[a-zA-Z0-9.-]+',
-                        rf'\1{CONFIG.public_domain}',
+                        rf'\g<1>{CONFIG.public_domain}',
                         updated_flag
                     )
 
