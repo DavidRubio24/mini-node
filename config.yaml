@@ -84,7 +84,61 @@ guacamole:
   password: "password"
   database: "guacamole"
   adminPassword: "xxxxxxxxx"
+  user_creator_password: "xxxxxxxxx"
 
+jobman:
+  # Optional: override settings.json -> job.resources used by jobman-service
+  # (config-ws.yaml ConfigMap). If omitted, defaults from the manifest are kept.
+  ws_job_resources:
+    default: "no-gpu"
+    label: "chaimeleon.eu/jobResourcesFlavor"
+    predefined:
+      - name: "small-gpu"
+        description: ""
+        maxRunTime: 16
+        resources:
+          requests:
+            cpu: "3000m"
+            memory: "28G"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "6000m"
+            memory: "28G"
+            nvidia.com/gpu: 1
+      - name: "medium-gpu"
+        description: ""
+        maxRunTime: 24
+        resources:
+          requests:
+            cpu: "7000m"
+            memory: "60G"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "8000m"
+            memory: "60G"
+            nvidia.com/gpu: 1
+      - name: "large-gpu"
+        description: ""
+        maxRunTime: 24
+        resources:
+          requests:
+            cpu: "7000m"
+            memory: "60G"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "8000m"
+            memory: "60G"
+            nvidia.com/gpu: 1
+      - name: "no-gpu"
+        description: ""
+        maxRunTime: 8
+        resources:
+          requests:
+            cpu: "7000m"
+            memory: "60G"
+          limits:
+            cpu: "8000m"
+            memory: "60G"
 focus:
   provider: "myprovidername"
     # Short provider identifier, e.g. 'upv' — used in beam app IDs
