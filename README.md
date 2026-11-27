@@ -88,6 +88,7 @@ Some repositories must be cloned manually before running the installation:
 
 - **dataset-explorer** — web frontend *(cloned inside k8s-deploy-node)*
   ```bash
+  cd k8s-deploy-node
   git clone https://github.com/EUCAIM/dataset-explorer.git
   cd ..
   ```
